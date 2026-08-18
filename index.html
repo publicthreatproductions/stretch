@@ -54,6 +54,20 @@ input[type=text]:focus,input[type=number]:focus{border-color:var(--amber);outlin
 .card h2{font-family:var(--mono);font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--dim);
   font-weight:500;margin-bottom:12px}
 
+function rawBox(){
+  var c=el("div","card");
+  c.appendChild(el("h2","","Raw data received (first 8 rows per tab)"));
+  var pre=document.createElement("pre");
+  pre.style.cssText="font-family:var(--mono);font-size:10px;color:var(--mut);white-space:pre-wrap;line-height:1.5;margin:0";
+  var out="";
+  TABS.forEach(function(t){
+    out+="== "+t+" ==\n";
+    (ST.tabs[t]||[]).slice(0,8).forEach(function(r,i){ out+=i+": "+JSON.stringify(r)+"\n"; });
+    out+="\n";
+  });
+  pre.textContent=out; c.appendChild(pre); return c;
+}
+
 /* ---------- headline ---------- */
 .headline{padding:22px 0 6px}
 .hl-date{font-family:var(--mono);font-size:clamp(38px,7vw,62px);line-height:1;letter-spacing:-.02em;font-weight:600}
@@ -242,17 +256,19 @@ function sheetId(url){
   return m?m[0]:null;
 }
 function tabURL(id,tab){
-  return "https://docs.google.com/spreadsheets/d/"+id+"/gviz/tq?tqx=out:csv&sheet="+encodeURIComponent(tab);
+  return "https://docs.google.com/spreadsheets/d/"+id+"/gviz/tq?tqx=out:csv&headers=0&sheet="+encodeURIComponent(tab);
 }
 function fetchAll(url){
   var id=sheetId(url);
-  if(!id) return Promise.reject({tab:"—",msg:"That doesn't look like a Google Sheets link. It should contain /spreadsheets/d/…"});
+  if(!id) return Promise.reject({tab:"—",msg:"That doesn't look like a Google Sheets link. It should contain /spreadsheets/d/\u2026"});
+  if(location.protocol==="file:") return Promise.reject({tab:"\u2014",msg:"This page is open from a file on your Mac (file:///\u2026). Safari blocks pages opened that way from reading anything on the internet, so it can never reach Google from here \u2014 nothing is wrong with your sheet. Put the file on GitHub Pages and open it at its https:// address."});
+  if(/[?&]rtpof=true/.test(url)) return Promise.reject({tab:"\u2014",msg:"That link points to an uploaded Excel file, not a native Google Sheet. Google will only serve data from a native Sheet. Open it and choose File \u2192 Save as Google Sheets \u2014 that makes a new copy. Share the copy, then paste its link here."});
   return Promise.all(TABS.map(function(t){
     return fetch(tabURL(id,t),{cache:"no-store"}).then(function(r){
       if(!r.ok) throw {tab:t,msg:"Google returned "+r.status+" for the “"+t+"” tab. Check the tab name and that the sheet is shared as “anyone with the link can view.”"};
       return r.text();
     }).then(function(txt){
-      if(/^\s*</.test(txt)) throw {tab:t,msg:"Google returned a login page instead of data. The sheet is not link-shared for viewing."};
+      if(/^\s*</.test(txt)) throw {tab:t,msg:"Google returned a sign-in page instead of data for the \u201c"+t+"\u201d tab. Either the sheet isn\u2019t shared as \u201canyone with the link can view,\u201d or it\u2019s an uploaded Excel file rather than a native Google Sheet."};
       return [t,parseCSV(txt)];
     });
   })).then(function(pairs){
@@ -261,7 +277,20 @@ function fetchAll(url){
 }
 
 /* ===================== table helpers ===================== */
-function findHeader(rows,names){
+function findHeader(rows,names,tab){
+  var h=findHeaderStrict(rows,names);
+  if(h) return h;
+  if(tab&&POS[tab]){
+    var first=0;
+    for(var r=0;r<Math.min(rows.length,10);r++){
+      var low=rows[r].map(function(c){return String(c).trim().toLowerCase();});
+      if(names.some(function(n){return low.indexOf(n)>=0;})){ first=r; break; }
+    }
+    return {row:first,map:POS[tab],fallback:true};
+  }
+  return null;
+}
+function findHeaderStrict(rows,names){
   for(var r=0;r<Math.min(rows.length,12);r++){
     var low=rows[r].map(function(c){return String(c).trim().toLowerCase();});
     var map={},hit=0;
@@ -273,14 +302,32 @@ function findHeader(rows,names){
   }
   return null;
 }
-function labelValue(rows,labels){
+function labelValue(rows,labels,kind){
+  var want = kind==="date" ? parseDate : parseNum;
   for(var r=0;r<rows.length;r++){
     var a=String(rows[r][0]||"").trim().toLowerCase();
     for(var i=0;i<labels.length;i++){
-      if(a.indexOf(labels[i])===0) return rows[r][1];
+      if(a.indexOf(labels[i])!==0) continue;
+      for(var c=1;c<Math.min(rows[r].length,8);c++){
+        var v=rows[r][c];
+        if(v==null||String(v).trim()==="") continue;
+        var got=want(v);
+        if(got!=null) return got;
+      }
+      return null;
     }
   }
   return null;
+}
+var POS={
+  "Monthly":{name:0,amount:1,"day of month":2,from:3,until:4},
+  "One-offs":{date:0,name:1,amount:2,type:3},
+  "Categories":{name:0,amount:1,period:2},
+  "Rebalance Log":{date:0,"actual balance":1,note:2}
+};
+function isExampleRow(row){
+  for(var i=0;i<row.length;i++){ if(/^\s*example\b/i.test(String(row[i]||""))) return true; }
+  return false;
 }
 
 /* ===================== model ===================== */
@@ -289,9 +336,9 @@ function buildModel(tabs){
 
   // -- Settings --
   var S=tabs["Settings"]||[];
-  M.pot=parseNum(labelValue(S,["total pot"]));
-  M.start=parseDate(labelValue(S,["start date"]));
-  M.wrap=parseDate(labelValue(S,["wrap date"]));
+  M.pot=labelValue(S,["total pot"],"num");
+  M.start=labelValue(S,["start date"],"date");
+  M.wrap=labelValue(S,["wrap date"],"date");
   if(M.pot==null) W.push("Settings: “Total pot” is empty or unreadable — using $0.");
   if(!M.start) W.push("Settings: “Start date” is empty or unreadable — using today.");
   if(!M.wrap) W.push("Settings: “Wrap date” is empty or unreadable.");
@@ -301,12 +348,12 @@ function buildModel(tabs){
 
   // -- Film --
   var F=tabs["Film"]||[];
-  M.film=parseNum(labelValue(F,["envelope total","envelope"]));
+  M.film=labelValue(F,["envelope total","envelope"],"num");
   if(M.film==null){M.film=0;}
 
   // -- Monthly --
   M.monthly=[];
-  var mt=tabs["Monthly"]||[], mh=findHeader(mt,["name","amount","day of month","from","until"]);
+  var mt=tabs["Monthly"]||[], mh=findHeader(mt,["name","amount","day of month","from","until"],"Monthly");
   if(!mh){ W.push("Monthly: couldn't find the header row (Name / Amount / Day of month)."); }
   else{
     for(var r=mh.row+1;r<mt.length;r++){
@@ -314,7 +361,7 @@ function buildModel(tabs){
       var amt=parseNum(rw[mh.map["amount"]]);
       var dom=parseNum(rw[mh.map["day of month"]]);
       if(!name&&amt==null) continue;
-      if(isExample(name)) continue;
+      if(isExampleRow(rw)) continue;
       if(amt==null||amt===0) continue;
       if(dom==null||dom<1||dom>31){
         W.push("Monthly row "+(r+1)+": “"+(name||"unnamed")+"” is "+USD(amt)+" but has no valid day-of-month, so it never charges. Add a day 1–31.");
@@ -328,7 +375,7 @@ function buildModel(tabs){
 
   // -- One-offs --
   M.oneoffs=[];
-  var ot=tabs["One-offs"]||[], oh=findHeader(ot,["date","name","amount","type"]);
+  var ot=tabs["One-offs"]||[], oh=findHeader(ot,["date","name","amount","type"],"One-offs");
   if(!oh){ W.push("One-offs: couldn't find the header row (Date / Name / Amount / Type)."); }
   else{
     for(var r2=oh.row+1;r2<ot.length;r2++){
@@ -336,7 +383,7 @@ function buildModel(tabs){
       var am=parseNum(rr[oh.map["amount"]]);
       var dt=parseDate(rr[oh.map["date"]]);
       if(!nm&&am==null) continue;
-      if(isExample(nm)) continue;
+      if(isExampleRow(rr)) continue;
       if(am==null||am===0) continue;
       if(!dt){ W.push("One-offs row "+(r2+1)+": “"+(nm||"unnamed")+"” has no readable date, so it never applies."); continue; }
       var ty=String(rr[oh.map["type"]]||"").trim().toLowerCase();
@@ -348,7 +395,7 @@ function buildModel(tabs){
 
   // -- Categories --
   M.cats=[];
-  var ct=tabs["Categories"]||[], ch=findHeader(ct,["name","amount","period"]);
+  var ct=tabs["Categories"]||[], ch=findHeader(ct,["name","amount","period"],"Categories");
   if(!ch){ W.push("Categories: couldn't find the header row (Name / Amount / Period)."); }
   else{
     for(var r3=ch.row+1;r3<ct.length;r3++){
@@ -356,26 +403,27 @@ function buildModel(tabs){
       var ca=parseNum(cr[ch.map["amount"]]);
       var cp=String(cr[ch.map["period"]]||"").trim().toLowerCase();
       if(!cn&&ca==null) continue;
-      if(isExample(cn)) continue;
+      if(isExampleRow(cr)) continue;
       if(ca==null||ca===0) continue;
       var per;
       if(cp.indexOf("day")===0)per=1; else if(cp.indexOf("week")===0)per=7; else if(cp.indexOf("month")===0)per=30.44;
       else{ W.push("Categories row "+(r3+1)+": “"+(cn||"unnamed")+"” has period “"+cp+"” — must be day, week, or month. Row ignored."); continue; }
-      M.cats.push({name:cn||"(unnamed)",amt:ca,period:cp,perDay:ca/per});
+      if(!cn) W.push("Categories row "+(r3+1)+": has an amount ("+USD(ca)+" / "+cp+") but no name. Add a name so it can be told apart.");
+      M.cats.push({name:cn||"(unnamed row "+(r3+1)+")",amt:ca,period:cp,perDay:ca/per});
     }
   }
   M.flexDay=M.cats.reduce(function(s,c){return s+c.perDay;},0);
 
   // -- Rebalance --
   M.rebal=null; M.rebalAll=[];
-  var rt=tabs["Rebalance Log"]||[], rh=findHeader(rt,["date","actual balance","note"]);
+  var rt=tabs["Rebalance Log"]||[], rh=findHeader(rt,["date","actual balance","note"],"Rebalance Log");
   if(rh){
     for(var r4=rh.row+1;r4<rt.length;r4++){
       var xr=rt[r4], nt=String(xr[rh.map["note"]]!=null?xr[rh.map["note"]]:"").trim();
       var bal=parseNum(xr[rh.map["actual balance"]]);
       var bd=parseDate(xr[rh.map["date"]]);
       if(bal==null&&!bd) continue;
-      if(isExample(nt)) continue;
+      if(isExampleRow(xr)) continue;
       if(bal==null||!bd){
         if(bal!=null&&!bd) W.push("Rebalance Log row "+(r4+1)+": balance "+USD(bal)+" has no readable date — ignored.");
         continue;
@@ -557,6 +605,20 @@ function warnBox(M){
   var u=el("ul");
   M.warnings.forEach(function(x){ u.appendChild(el("li","",x)); });
   d.appendChild(u); return d;
+}
+
+function rawBox(){
+  var c=el("div","card");
+  c.appendChild(el("h2","","Raw data received (first 8 rows per tab)"));
+  var pre=document.createElement("pre");
+  pre.style.cssText="font-family:var(--mono);font-size:10px;color:var(--mut);white-space:pre-wrap;line-height:1.5;margin:0";
+  var out="";
+  TABS.forEach(function(t){
+    out+="== "+t+" ==\n";
+    (ST.tabs[t]||[]).slice(0,8).forEach(function(r,i){ out+=i+": "+JSON.stringify(r)+"\n"; });
+    out+="\n";
+  });
+  pre.textContent=out; c.appendChild(pre); return c;
 }
 
 /* ---------- headline ---------- */
